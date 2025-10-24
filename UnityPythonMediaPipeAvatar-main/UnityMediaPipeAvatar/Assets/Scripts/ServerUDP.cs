@@ -1,103 +1,184 @@
+// ServerUDP.cs (ตัวอย่าง robust implementation)
 using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Net.Sockets;
 using System.Net;
+using System.Net.Sockets;
+using System.Text;
 using System.Threading;
+using UnityEngine;
 
-/// <summary>
-/// A basic UDP server that listens to a port for incoming data.
-/// </summary>
-class ServerUDP
+public class ServerUDP
 {
-    UdpClient server;
-    IPEndPoint endPoint;
-    bool open;
+    private UdpClient udp;
+    private IPEndPoint remoteEP;
+    private Thread listenThread;
+    private volatile bool isListening = false;
 
-    const int BUFFER_SIZE = 1024;
-    byte[] buffer = new byte[BUFFER_SIZE];
-    string latestResponse;
+    private readonly string host;
+    private readonly int port;
 
-    string[] eom = new string[] { "<EOM>" };
-    Queue<string> messageBuffer = new Queue<string>(); // Used when receive messages faster than we can process it.
-    int maxMessageBufferSize;
-    bool suppressWarnings;
+    private readonly object messageLock = new object();
+    private string lastMessage = null;
 
-    int port;
-    byte[] aliveBuffer = new byte[] { 1 };
-
-    public ServerUDP(string ip, int port, bool suppressWarnings = true, int maximumMessageBufferSize = 100)
+    public ServerUDP(string host, int port)
     {
-        server = new UdpClient(port, AddressFamily.InterNetwork);
-        endPoint = default(IPEndPoint);
-        maxMessageBufferSize = maximumMessageBufferSize;
+        this.host = host;
         this.port = port;
-        this.suppressWarnings = suppressWarnings;
     }
+
     public void Connect()
     {
-        open = true;
+        // Bind to local endpoint (listen)
+        try
+        {
+            remoteEP = new IPEndPoint(IPAddress.Any, port);
+            udp = new UdpClient(port);
+            udp.Client.ReceiveTimeout = 1000; // short timeout so thread can check isListening frequently
+            Debug.Log($"ServerUDP: Bound to port {port}");
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("ServerUDP Connect exception: " + e.Message);
+            throw;
+        }
     }
-    public void Disconnect()
-    {
-        server.Close();
-        open = false;
-    }
+
     public void StartListeningAsync()
     {
-        Thread t = new Thread(new ThreadStart(StartListening));
-        t.Start();
+        if (isListening) return;
+        isListening = true;
+        listenThread = new Thread(ListenLoop);
+        listenThread.IsBackground = true;
+        listenThread.Start();
     }
-    public void StartListening()
-    {
-        print("Waiting for messages @Port:"+port);
-        messageBuffer.Clear();
-        open = true;
 
-        while (open)
+    private void ListenLoop()
+    {
+        Debug.Log("ServerUDP: ListenLoop started.");
+        try
         {
-            try
+            while (isListening)
             {
-                buffer = server.Receive(ref endPoint);
-                if (buffer.Length > 0)
+                try
                 {
-                    latestResponse = Encoding.UTF8.GetString(buffer, 0, buffer.Length);
-                    string[] sa = latestResponse.Split(eom, StringSplitOptions.None);
-                    for (int i = 0; i < sa.Length - 1; ++i)
+                    // Use Receive with timeout; if socket closed it will throw ObjectDisposedException or SocketException
+                    byte[] data = udp.Receive(ref remoteEP);
+                    if (data != null && data.Length > 0)
                     {
-                        if (messageBuffer.Count >= maxMessageBufferSize)
+                        string msg = Encoding.UTF8.GetString(data);
+                        lock (messageLock)
                         {
-                            messageBuffer.Dequeue();
-                            if(!suppressWarnings)
-                                print("Too slow to keep up with packets being sent (dropping old data). Make sure you are getting messages with GetMessage().");
+                            lastMessage = msg;
                         }
-                        messageBuffer.Enqueue(sa[i]);
-                        print("(" + messageBuffer.Count + ") " + sa[i]);
                     }
                 }
+                catch (SocketException sex)
+                {
+                    // Receive timeout or socket closed
+                    // Timeout code: 10060 or others - ignore if we're stopping
+                    if (!isListening)
+                    {
+                        break;
+                    }
+                    // If real socket error, log for debug but continue/loop
+                    Debug.LogWarning("ServerUDP SocketException: " + sex.Message);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Socket closed while receiving - shut down loop gracefully
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("ServerUDP ListenLoop exception: " + ex.Message);
+                    // small sleep to avoid busy spin on unknown errors
+                    Thread.Sleep(10);
+                }
             }
-            catch (SocketException ex)
-            {
-                print("Connection lost.");
-                System.Threading.Thread.Sleep(1000);
-
-                    StartListening();
-                break;
-            }
+        }
+        finally
+        {
+            Debug.Log("ServerUDP: ListenLoop exiting.");
         }
     }
 
     public bool HasMessage()
     {
-        return messageBuffer.Count > 0;
-    }
-    public string GetMessage()
-    {
-        return messageBuffer.Dequeue();
+        lock (messageLock)
+        {
+            return !string.IsNullOrEmpty(lastMessage);
+        }
     }
 
-    private void print(object o)
+    public string GetMessage()
     {
-        Console.WriteLine(o);
+        lock (messageLock)
+        {
+            string m = lastMessage;
+            lastMessage = null;
+            return m;
+        }
+    }
+
+    // Gracefully stop listening and close socket
+    public void StopListening()
+    {
+        Debug.Log("ServerUDP: StopListening called.");
+        isListening = false;
+
+        try
+        {
+            if (udp != null)
+            {
+                try
+                {
+                    // Closing UDP will unblock Receive and lead to ObjectDisposedException inside Receive,
+                    // which our ListenLoop handles by breaking the loop.
+                    udp.Close();
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning("ServerUDP StopListening close exception: " + e.Message);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("ServerUDP StopListening exception: " + e.Message);
+        }
+    }
+
+    // Wait for listen thread to stop (call after StopListening)
+    public void WaitForStop(int millisecondsTimeout = 2000)
+    {
+        if (listenThread != null)
+        {
+            try
+            {
+                if (!listenThread.Join(millisecondsTimeout))
+                {
+                    Debug.LogWarning("ServerUDP: listenThread did not exit in time.");
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("ServerUDP WaitForStop exception: " + e.Message);
+            }
+            finally
+            {
+                listenThread = null;
+            }
+        }
+    }
+
+    // Full disconnect (stop + cleanup)
+    public void Disconnect()
+    {
+        StopListening();
+        WaitForStop(2000);
+        if (udp != null)
+        {
+            try { udp.Close(); } catch { }
+            udp = null;
+        }
     }
 }

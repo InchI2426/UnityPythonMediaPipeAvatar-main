@@ -1,4 +1,5 @@
-// REVIEWS
+// PipeServer.cs (แก้ไขให้ใช้ lifecycle แบบระยะยาว ปิด thread/resource อย่างปลอดภัย)
+using System;
 using System.Collections;
 using System.IO;
 using System.IO.Pipes;
@@ -7,8 +8,10 @@ using System.Text;
 using System.Threading;
 using UnityEngine;
 
-/* Currently very messy because both the server code and hand-drawn code is all in the same file here.
- * But it is still fairly straightforward to use as a reference/base.
+/* Updated PipeServer with proper thread lifecycle handling and safe cleanup.
+ * - Uses serverThread and isRunning flag to stop Run() gracefully.
+ * - Provides CleanupResources() to dispose sockets/pipes.
+ * - OnApplicationQuit waits for serverThread to finish (with timeout).
  */
 
 [DefaultExecutionOrder(-1)]
@@ -35,6 +38,10 @@ public class PipeServer : MonoBehaviour
 
     private Body body;
 
+    // Thread management
+    private Thread serverThread;
+    private volatile bool isRunning = false;
+
     // these virtual transforms are not actually provided by mediapipe pose, but are required for avatars.
     // so I just manually compute them
     private Transform virtualNeck;
@@ -42,7 +49,7 @@ public class PipeServer : MonoBehaviour
 
     public Transform GetLandmark(Landmark mark)
     {
-        return body.instances[(int)mark].transform ;
+        return body.instances[(int)mark].transform;
     }
     public Transform GetVirtualNeck()
     {
@@ -57,13 +64,17 @@ public class PipeServer : MonoBehaviour
     {
         System.Globalization.CultureInfo.DefaultThreadCurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
 
-        body = new Body(bodyParent,landmarkPrefab,linePrefab,landmarkScale,enableHead?headPrefab:null);
+        body = new Body(bodyParent, landmarkPrefab, linePrefab, landmarkScale, enableHead ? headPrefab : null);
         virtualNeck = new GameObject("VirtualNeck").transform;
         virtualHip = new GameObject("VirtualHip").transform;
 
-        Thread t = new Thread(new ThreadStart(Run));
-        t.Start();
+        // Start server thread
+        isRunning = true;
+        serverThread = new Thread(new ThreadStart(Run));
+        serverThread.IsBackground = true;
+        serverThread.Start();
     }
+
     private void Update()
     {
         UpdateBody(body);
@@ -75,16 +86,16 @@ public class PipeServer : MonoBehaviour
         {
             if (b.positionsBuffer[i].accumulatedValuesCount < samplesForPose)
                 continue;
-            
+
             b.localPositionTargets[i] = b.positionsBuffer[i].value / (float)b.positionsBuffer[i].accumulatedValuesCount * multiplier;
-            b.positionsBuffer[i] = new AccumulatedBuffer(Vector3.zero,0);
+            b.positionsBuffer[i] = new AccumulatedBuffer(Vector3.zero, 0);
         }
 
         Vector3 offset = Vector3.zero;
         for (int i = 0; i < LANDMARK_COUNT; ++i)
         {
-            Vector3 p = b.localPositionTargets[i]-offset;
-            b.instances[i].transform.localPosition=Vector3.MoveTowards(b.instances[i].transform.localPosition, p, Time.deltaTime * maxSpeed);
+            Vector3 p = b.localPositionTargets[i] - offset;
+            b.instances[i].transform.localPosition = Vector3.MoveTowards(b.instances[i].transform.localPosition, p, Time.deltaTime * maxSpeed);
         }
 
         virtualNeck.transform.position = (b.instances[(int)Landmark.RIGHT_SHOULDER].transform.position + b.instances[(int)Landmark.LEFT_SHOULDER].transform.position) / 2f;
@@ -92,6 +103,7 @@ public class PipeServer : MonoBehaviour
 
         b.UpdateLines();
     }
+
     public void SetVisible(bool visible)
     {
         bodyParent.gameObject.SetActive(visible);
@@ -101,80 +113,236 @@ public class PipeServer : MonoBehaviour
     {
         System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
 
-        if (useLegacyPipes)
+        try
         {
-            // Open the named pipe.
-            serverNP = new NamedPipeServerStream("UnityMediaPipeBody1", PipeDirection.InOut, 99, PipeTransmissionMode.Message);
-
-            print("Waiting for connection...");
-            serverNP.WaitForConnection();
-
-            print("Connected.");
-            reader = new BinaryReader(serverNP, Encoding.UTF8);
-        }
-        else
-        {
-            server = new ServerUDP(host, port);
-            server.Connect();
-            server.StartListeningAsync();
-            print("Listening @"+host+":"+port);
-        }
-
-        while (true)
-        {
-            try
+            if (useLegacyPipes)
             {
-                Body h = body;
-                var len = 0;
-                var str = "";
+                // Open the named pipe.
+                serverNP = new NamedPipeServerStream("UnityMediaPipeBody1", PipeDirection.InOut, 99, PipeTransmissionMode.Message);
+                Debug.Log("PipeServer: Waiting for connection (NamedPipe)...");
+                // WaitForConnection is blocking; if we need to abort, closing the stream from another thread will raise an exception
+                serverNP.WaitForConnection();
+                Debug.Log("PipeServer: Connected (NamedPipe).");
+                reader = new BinaryReader(serverNP, Encoding.UTF8);
+            }
+            else
+            {
+                server = new ServerUDP(host, port);
+                server.Connect();
+                server.StartListeningAsync();
+                Debug.Log($"PipeServer: Listening @{host}:{port}");
+            }
 
-                if (useLegacyPipes)
+            // Main receive loop
+            while (isRunning)
+            {
+                try
                 {
-                    len = (int)reader.ReadUInt32();
-                    str = new string(reader.ReadChars(len));
-                }
-                else
-                {
-                    if(server.HasMessage())
-                        str = server.GetMessage();
-                    len = str.Length;
-                }
+                    Body h = body;
+                    var len = 0;
+                    var str = "";
 
-                string[] lines = str.Split('\n');
-                foreach (string l in lines)
-                {
-                    if (string.IsNullOrWhiteSpace(l))
+                    if (useLegacyPipes)
+                    {
+                        // If pipe not connected, small sleep
+                        if (serverNP == null || !serverNP.IsConnected)
+                        {
+                            Thread.Sleep(10);
+                            continue;
+                        }
+
+                        // BinaryReader.ReadUInt32 will block until data; if stream is closed from another thread it will throw
+                        len = (int)reader.ReadUInt32();
+                        if (len <= 0)
+                        {
+                            // nothing
+                            continue;
+                        }
+                        str = new string(reader.ReadChars(len));
+                    }
+                    else
+                    {
+                        if (server.HasMessage())
+                        {
+                            str = server.GetMessage();
+                        }
+                        else
+                        {
+                            // no message - avoid busy loop
+                            Thread.Sleep(1);
+                            continue;
+                        }
+                        len = str.Length;
+                    }
+
+                    if (string.IsNullOrEmpty(str))
                         continue;
-                    string[] s = l.Split('|');
-                    if (s.Length < 4) continue;
-                    int i;
-                    if (!int.TryParse(s[0], out i)) continue;
-                    h.positionsBuffer[i].value += new Vector3(float.Parse(s[1]), float.Parse(s[2]), float.Parse(s[3]));
-                    h.positionsBuffer[i].accumulatedValuesCount += 1;
-                    h.active = true;
+
+                    string[] lines = str.Split('\n');
+                    foreach (string l in lines)
+                    {
+                        if (string.IsNullOrWhiteSpace(l))
+                            continue;
+                        string[] s = l.Split('|');
+                        if (s.Length < 4) continue;
+                        int i;
+                        if (!int.TryParse(s[0], out i)) continue;
+                        // Parse floats using invariant culture
+                        float x = float.Parse(s[1]);
+                        float y = float.Parse(s[2]);
+                        float z = float.Parse(s[3]);
+                        h.positionsBuffer[i].value += new Vector3(x, y, z);
+                        h.positionsBuffer[i].accumulatedValuesCount += 1;
+                        h.active = true;
+                    }
+                }
+                catch (EndOfStreamException)
+                {
+                    Debug.Log("PipeServer: Client Disconnected (EndOfStream).");
+                    break;
+                }
+                catch (IOException ioex)
+                {
+                    Debug.LogWarning("PipeServer IO exception: " + ioex.Message);
+                    // Likely stream closed during shutdown - break
+                    break;
+                }
+                catch (ThreadAbortException)
+                {
+                    Debug.Log("PipeServer: ThreadAbortException caught - exiting loop.");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("PipeServer Run() exception: " + ex.Message);
+                    // For non-fatal errors, continue loop unless shutting down
+                    if (!isRunning)
+                        break;
                 }
             }
-            catch (EndOfStreamException)
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("PipeServer startup exception: " + e.Message);
+        }
+        finally
+        {
+            // Ensure resources cleaned up if loop exits
+            CleanupResources();
+            Debug.Log("PipeServer: Run() exiting.");
+        }
+    }
+
+    // Centralized cleanup used by OnApplicationQuit and finally block
+    private void CleanupResources()
+    {
+        try
+        {
+            Debug.Log("PipeServer: Cleaning up resources...");
+            if (useLegacyPipes)
             {
-                print("Client Disconnected");
-                break;
+                if (reader != null)
+                {
+                    try { reader.Close(); } catch { }
+                    reader = null;
+                }
+                if (serverNP != null)
+                {
+                    try { serverNP.Disconnect(); } catch { }
+                    try { serverNP.Close(); serverNP.Dispose(); } catch { }
+                    serverNP = null;
+                }
+            }
+            else
+            {
+                if (server != null)
+                {
+                    try { server.Disconnect(); } catch { }
+                    server = null;
+                }
             }
         }
-
+        catch (Exception e)
+        {
+            Debug.LogWarning("PipeServer CleanupResources exception: " + e.Message);
+        }
     }
 
     private void OnDisable()
     {
-        print("Client disconnected.");
-        if (useLegacyPipes)
+        // Ensure orderly shutdown when object disabled (e.g. stop play in Editor)
+        OnApplicationQuit();
+    }
+
+    private void OnApplicationQuit()
+    {
+        Debug.Log("PipeServer: OnApplicationQuit called - shutting down server thread and resources.");
+
+        // Signal the run loop to stop
+        isRunning = false;
+
+        // Close resources to unblock any blocking reads/waits
+        try
         {
-            serverNP.Close();
-            serverNP.Dispose();
+            if (useLegacyPipes)
+            {
+                if (reader != null)
+                {
+                    try { reader.Close(); } catch { }
+                    reader = null;
+                }
+                if (serverNP != null)
+                {
+                    try { serverNP.Close(); serverNP.Dispose(); } catch { }
+                    serverNP = null;
+                }
+            }
+            else
+            {
+                if (server != null)
+                {
+                    try { server.StopListening(); server.WaitForStop(2000); server.Disconnect(); } catch { }
+                    server = null;
+                }
+            }
         }
-        else
+        catch (Exception e)
         {
-            server.Disconnect();
+            Debug.LogWarning("PipeServer OnApplicationQuit early cleanup error: " + e.Message);
         }
+
+        // Wait for thread to finish gracefully
+        if (serverThread != null && serverThread.IsAlive)
+        {
+            try
+            {
+                // Give thread a short time to exit cleanly
+                if (!serverThread.Join(2000))
+                {
+                    Debug.LogWarning("PipeServer: serverThread did not exit in time.");
+                    // As last resort, attempt abort (not recommended for normal operation)
+                    try
+                    {
+                        serverThread.Abort();
+                    }
+                    catch (Exception abortExc)
+                    {
+                        Debug.LogWarning("PipeServer: Thread.Abort failed: " + abortExc.Message);
+                    }
+                }
+            }
+            catch (Exception joinEx)
+            {
+                Debug.LogWarning("PipeServer waiting for thread error: " + joinEx.Message);
+            }
+            finally
+            {
+                serverThread = null;
+            }
+        }
+
+        // Final cleanup to be safe
+        CleanupResources();
     }
 
     const int LANDMARK_COUNT = 33;
@@ -290,7 +458,7 @@ public class PipeServer : MonoBehaviour
             lines[10].SetPosition(4, Position((Landmark)7));
         }
 
-        public Vector3 Direction(Landmark from,Landmark to)
+        public Vector3 Direction(Landmark from, Landmark to)
         {
             return (instances[(int)to].transform.position - instances[(int)from].transform.position).normalized;
         }
