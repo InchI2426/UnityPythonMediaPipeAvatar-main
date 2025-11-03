@@ -46,6 +46,16 @@ class BodyThread(threading.Thread):
     pipe = None
     timeSinceCheckedConnection = 0
     timeSincePostStatistics = 0
+    
+    def stop(self):
+        print("[Python] Stopping BodyThread...")
+        try:
+            if hasattr(self, "cap") and self.cap is not None:
+                self.cap.release()
+                print("[Python] Camera released.")
+        except Exception as e:
+            print("[Python] Error releasing camera:", e)
+        self.running = False
 
     def run(self):
         mp_drawing = mp.solutions.drawing_utils
@@ -137,5 +147,4 @@ class BodyThread(threading.Thread):
                 except Exception as ex:  
                     print("Failed to write to pipe. Is the unity project open?")
                     self.pipe= None
-        pass
-                        
+        pass                      

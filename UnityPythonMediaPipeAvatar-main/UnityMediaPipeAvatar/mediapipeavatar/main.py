@@ -5,31 +5,23 @@ import struct
 import global_vars
 from body import BodyThread
 from sys import exit
-
 quit_flag = False
-
 # ============================================================
-# 🧩 ฟังก์ชันรอ Unity ก่อนเริ่ม
-def wait_for_unity(host="127.0.0.1", port=52733, timeout=10):
+def wait_for_unity(host="127.0.0.1", port=52733, timeout=5):
     print("[Python] Waiting for Unity to connect...")
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(1.0)
+    s.settimeout(0.5)
     start = time.time()
     while time.time() - start < timeout:
         try:
             s.sendto(b"__ping__", (host, port))
-            print("[Python] Ping Unity...")
-            time.sleep(1)
+            time.sleep(0.3)
         except Exception:
             pass
     s.close()
     print("[Python] Done waiting. Starting BodyThread...")
 # ============================================================
-
-
-# ============================================================
-# 🧩 ฟังก์ชันรอฟังสัญญาณปิดจาก Unity
-def quit_listener(port=54321):
+def quit_listener(port=54321): #ฟังก์ชันรอฟังสัญญาณปิดจาก Unity
     global quit_flag
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("127.0.0.1", port))
@@ -47,9 +39,6 @@ def quit_listener(port=54321):
             continue
     s.close()
 # ============================================================
-
-
-# ✅ เริ่มรอ Unity ก่อนทำงาน
 wait_for_unity()
 
 # ✅ สตาร์ทตัวรับสัญญาณปิด
@@ -73,4 +62,7 @@ global_vars.KILL_THREADS = True
 quit_flag = True
 time.sleep(0.5)
 print("[Python] Exiting gracefully.")
+
+if hasattr(thread, "stop"):
+    thread.stop()
 exit()
